@@ -1,0 +1,7 @@
+{
+  "name": "lokasolve",
+  "private": true,
+  "workspaces": [
+    "apps/web"
+  ]
+}

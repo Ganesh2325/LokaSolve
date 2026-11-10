@@ -1,0 +1,840 @@
+openapi: 3.0.3
+info:
+  title: LokaSolve API
+  version: 0.1.0
+  description: |
+    Stage 1 contract, plus the report and media rules in docs/api/report-access.md.
+    A public report response omits address, coordinates, narrative, answers, and media.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local Go API. The browser reaches it through the Next.js /api proxy.
+tags:
+  - name: system
+  - name: auth
+  - name: profile
+  - name: organizations
+  - name: admin
+  - name: reports
+  - name: media
+paths:
+  /healthz:
+    get:
+      tags: [system]
+      summary: Process is running
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+  /readyz:
+    get:
+      tags: [system]
+      summary: Postgres is reachable
+      description: Redis status is reported and does not alone mark the API unready.
+      responses:
+        "200":
+          description: Database is up
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, database, redis]
+                properties:
+                  status: { type: string, example: ready }
+                  database: { type: string, example: up }
+                  redis: { type: string, enum: [up, down, not_configured] }
+        "503":
+          description: Database is down
+  /api/v1/auth/register:
+    post:
+      tags: [auth]
+      summary: Create an account and a session
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, display_name, account_kind]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 10, maxLength: 128 }
+                display_name: { type: string }
+                preferred_language: { type: string, enum: [en, hi], default: en }
+                account_kind: { type: string, enum: [resident, provider, organization] }
+                organization_name: { type: string }
+                organization_type:
+                  type: string
+                  enum: [municipality, utility, business, ngo, institution, service_provider, other]
+      responses:
+        "201":
+          description: Account created. Also sets the refresh cookie.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "409":
+          description: Email already registered, or the idempotency key was reused with a different body.
+        "400":
+          $ref: "#/components/responses/Validation"
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Sign in with email and password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string }
+                password: { type: string }
+      responses:
+        "200":
+          description: Session issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401":
+          description: Unknown user or wrong password. The body does not say which.
+        "423":
+          description: Account is temporarily or administratively locked.
+        "429":
+          description: IP or email rate limit.
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotate a refresh token
+      description: |
+        Send `refresh_token` in JSON, or omit it and send the HttpOnly cookie
+        together with header `X-LokaSolve-Client: web`. Reuse of a rotated
+        token revokes the session family.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "200":
+          description: New session
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401":
+          description: Unknown, expired, or reused refresh token.
+        "403":
+          description: Cookie was presented without the web client header.
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: Revoke the presented refresh session
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                refresh_token: { type: string }
+      responses:
+        "204":
+          description: Session revoked and cookie cleared.
+        "401":
+          description: Refresh token was not valid.
+  /api/v1/auth/otp/request:
+    post:
+      tags: [auth]
+      summary: Request a login code for a verified phone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtpRequest" }
+      responses:
+        "202":
+          description: Acknowledged. Unknown phones get the same body. The code is not returned.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: received }
+        "503":
+          description: The SMS sender failed. The challenge is removed.
+  /api/v1/auth/otp/verify:
+    post:
+      tags: [auth]
+      summary: Sign in with a phone code
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtpVerify" }
+      responses:
+        "200":
+          description: Session issued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "401":
+          description: Code is wrong, expired, or the phone is not verified for login.
+  /api/v1/me:
+    get:
+      tags: [profile]
+      security: [{ bearer: [] }]
+      summary: Current user
+      responses:
+        "200":
+          description: Profile and global roles
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+    patch:
+      tags: [profile]
+      security: [{ bearer: [] }]
+      summary: Update profile fields that were sent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name: { type: string }
+                preferred_language: { type: string, enum: [en, hi] }
+                notification_preferences:
+                  type: object
+                  additionalProperties: { type: boolean }
+                  description: Allowed keys are in_app, email, sms, and whatsapp.
+                privacy_preferences:
+                  type: object
+                  additionalProperties: { type: boolean }
+                  description: Allowed key is public_identity.
+      responses:
+        "200":
+          description: Updated user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+  /api/v1/me/locations:
+    get:
+      tags: [profile]
+      security: [{ bearer: [] }]
+      summary: Saved places for the signed-in user
+      responses:
+        "200":
+          description: Places, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Location" }
+    post:
+      tags: [profile]
+      security: [{ bearer: [] }]
+      summary: Save a place
+      description: |
+        Latitude and longitude are stored only when both are present and inside
+        range. An address or locality alone leaves coordinates and geometry null.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source]
+              properties:
+                label: { type: string }
+                address_text: { type: string }
+                locality_text: { type: string }
+                latitude: { type: number, minimum: -90, maximum: 90 }
+                longitude: { type: number, minimum: -180, maximum: 180 }
+                source: { type: string, enum: [user_gps, user_pin, user_address, user_locality] }
+      responses:
+        "201":
+          description: Place saved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Location" }
+  /api/v1/me/locations/{locationID}:
+    delete:
+      tags: [profile]
+      security: [{ bearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/LocationID"
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/me/deletion-request:
+    post:
+      tags: [profile]
+      security: [{ bearer: [] }]
+      summary: Ask for account deletion
+      description: Creates a privacy request and sets status pending_deletion. The account is not erased.
+      responses:
+        "201":
+          description: Request recorded
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PrivacyRequest" }
+  /api/v1/me/phone/otp/request:
+    post:
+      tags: [auth]
+      security: [{ bearer: [] }]
+      summary: Send a code to verify the signed-in user's phone
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtpRequest" }
+      responses:
+        "202":
+          description: Acknowledged. Does not opt the user into SMS notifications.
+  /api/v1/me/phone/otp/verify:
+    post:
+      tags: [auth]
+      security: [{ bearer: [] }]
+      summary: Mark the phone verified
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OtpVerify" }
+      responses:
+        "200":
+          description: Phone verified
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "409":
+          description: That phone is already verified on another account.
+  /api/v1/me/organizations:
+    get:
+      tags: [organizations]
+      security: [{ bearer: [] }]
+      summary: Organizations the user belongs to
+      responses:
+        "200":
+          description: Memberships
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Organization" }
+  /api/v1/organizations:
+    post:
+      tags: [organizations]
+      security: [{ bearer: [] }]
+      summary: Create an organization and become its owner
+      description: Requires feature flag org_self_service unless the caller is a super administrator.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, org_type]
+              properties:
+                name: { type: string }
+                org_type:
+                  type: string
+                  enum: [municipality, utility, business, ngo, institution, service_provider, other]
+      responses:
+        "201":
+          description: Organization created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Organization" }
+  /api/v1/organizations/{organizationID}:
+    get:
+      tags: [organizations]
+      security: [{ bearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OrganizationID"
+      responses:
+        "200":
+          description: Organization visible to the caller
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Organization" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/organizations/{organizationID}/members:
+    get:
+      tags: [organizations]
+      security: [{ bearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OrganizationID"
+      responses:
+        "200":
+          description: Active members
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Member" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [organizations]
+      security: [{ bearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OrganizationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, member_role]
+              properties:
+                email: { type: string }
+                member_role: { type: string, enum: [owner, admin, member, field_worker] }
+      responses:
+        "204":
+          description: Member added or reactivated
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: That person is already an active member. An unknown email is 404 user_not_found, not 409.
+  /api/v1/organizations/{organizationID}/members/{userID}:
+    delete:
+      tags: [organizations]
+      security: [{ bearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OrganizationID"
+        - $ref: "#/components/parameters/UserID"
+      responses:
+        "204":
+          description: Member removed and scoped roles deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/organizations/{organizationID}/departments:
+    get:
+      tags: [organizations]
+      security: [{ bearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OrganizationID"
+      responses:
+        "200":
+          description: Departments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Department" }
+    post:
+      tags: [organizations]
+      security: [{ bearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OrganizationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: Department created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Department" }
+  /api/v1/organizations/{organizationID}/teams:
+    post:
+      tags: [organizations]
+      security: [{ bearer: [] }]
+      parameters:
+        - $ref: "#/components/parameters/OrganizationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                department_id: { type: string, format: uuid }
+      responses:
+        "201":
+          description: Team created. department_id must belong to the same organization when set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Team" }
+  /api/v1/feature-flags:
+    get:
+      tags: [profile]
+      security: [{ bearer: [] }]
+      summary: Public feature flags
+      responses:
+        "200":
+          description: Flag map
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: { type: boolean }
+  /api/v1/admin/users:
+    get:
+      tags: [admin]
+      security: [{ bearer: [] }]
+      summary: List users
+      description: Requires admin:users_read. Residents receive 403.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: User page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/AdminUser" }
+                  next_cursor: { type: string }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/v1/admin/users/{userID}/roles:
+    post:
+      tags: [admin]
+      security: [{ bearer: [] }]
+      summary: Grant a platform role
+      description: Requires admin:roles_grant. Only support_agent and super_admin can be granted here.
+      parameters:
+        - $ref: "#/components/parameters/UserID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role_code]
+              properties:
+                role_code: { type: string, enum: [support_agent, super_admin] }
+      responses:
+        "204":
+          description: Grant recorded in the audit log
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/v1/admin/audit-logs:
+    get:
+      tags: [admin]
+      security: [{ bearer: [] }]
+      summary: Read audit records
+      description: Requires admin:audit_read.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Audit page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuditRecord" }
+                  next_cursor: { type: string }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /api/v1/issues:
+    post:
+      tags: [reports]
+      security: [{ bearer: [] }]
+      summary: Save a report for the signed-in person
+      responses:
+        "201":
+          description: Owner view of the new report, including the address and coordinates the person supplied.
+        "400":
+          description: Validation error. Coordinates are never guessed.
+    get:
+      tags: [reports]
+      security: [{ bearer: [] }]
+      summary: List the signed-in person's own reports
+      responses:
+        "200":
+          description: Owner views only. Another person's reports are not included.
+  /api/v1/issues/{issueID}:
+    get:
+      tags: [reports]
+      security: [{ bearer: [] }]
+      summary: Read one report under server-side access rules
+      description: |
+        The owner and a super administrator receive the stored report.
+        An assigned responder whose assignment is not rejected receives the case fields needed for the work.
+        An active member of a municipality, utility, or institution receives the case only when the report locality exactly matches one of that organization's jurisdictions.
+        Anyone else receives the public card when the report is public, and the same not-found response used for a missing id when it is not.
+        The public card has id, category_label, locality_text, status, created_at, visibility=public, and summary. It omits description, address_text, latitude, longitude, answers, and identity_visible_to_resolver.
+      responses:
+        "200":
+          description: Owner, assignment, jurisdiction, admin, or public representation.
+        "404":
+          description: The report is missing or the caller cannot know that it exists.
+  /api/v1/nearby:
+    get:
+      tags: [reports]
+      security: [{ bearer: [] }]
+      summary: List public report cards
+      description: Cards omit exact address, coordinates, narrative, and media.
+      responses:
+        "200":
+          description: Sanitized public cards.
+  /api/v1/issues/{issueID}/media:
+    post:
+      tags: [media]
+      security: [{ bearer: [] }]
+      summary: Upload a photo, audio file, or video for a report the caller owns
+      description: |
+        Multipart field `file`. The server identifies the format from the bytes and rejects a declared Content-Type or extension that disagrees.
+        Allowed formats are JPEG, PNG, WEBP, GIF, MP3, M4A, MP4, and WEBM, up to 4 MB.
+        The stored name is server-generated. `malware_scan` is `not_scanned` until a scanner is connected. That value is not a clean verdict.
+      responses:
+        "201":
+          description: Media metadata. Bytes are not returned.
+        "400":
+          description: Empty, oversized, malformed, unsupported, spoofed, or mismatched file.
+        "404":
+          description: The caller does not own the report.
+    get:
+      tags: [media]
+      security: [{ bearer: [] }]
+      summary: List media the caller is allowed to open
+      description: Public visibility does not include media. A rejected assignment no longer grants access.
+      responses:
+        "200":
+          description: Metadata for authorized media. An unauthorized caller receives an empty list.
+  /api/v1/issues/{issueID}/media/{mediaID}:
+    get:
+      tags: [media]
+      security: [{ bearer: [] }]
+      summary: Download one authorized media object
+      description: |
+        Requires the owner, an active assignee, an in-jurisdiction officer, or a super administrator.
+        Response headers include the sniffed content type, `X-Content-Type-Options: nosniff`, a server file name, and `X-Malware-Scan`.
+        `X-Malware-Scan: not_scanned` means no malware scanner ran.
+      responses:
+        "200":
+          description: File bytes.
+        "401":
+          description: Missing or invalid session.
+        "404":
+          description: The same response for a missing file and a file the caller cannot access.
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      schema: { type: string }
+      required: false
+    OrganizationID:
+      in: path
+      name: organizationID
+      required: true
+      schema: { type: string, format: uuid }
+    UserID:
+      in: path
+      name: userID
+      required: true
+      schema: { type: string, format: uuid }
+    LocationID:
+      in: path
+      name: locationID
+      required: true
+      schema: { type: string, format: uuid }
+    Cursor:
+      in: query
+      name: cursor
+      schema: { type: string }
+    Limit:
+      in: query
+      name: limit
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+  responses:
+    Validation:
+      description: Field errors
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: The caller cannot see that record, or it does not exist.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: The caller can be identified but cannot perform the action.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      required: [error, request_id]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  message: { type: string }
+        request_id: { type: string }
+    User:
+      type: object
+      required: [id, display_name, preferred_language, status, is_demo, roles, email_verified, phone_verified]
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, nullable: true }
+        phone_e164: { type: string, nullable: true }
+        display_name: { type: string }
+        preferred_language: { type: string }
+        status: { type: string }
+        is_demo: { type: boolean }
+        roles:
+          type: array
+          items: { type: string }
+          description: Global roles only.
+        notification_preferences:
+          type: object
+          additionalProperties: { type: boolean }
+        privacy_preferences:
+          type: object
+          additionalProperties: { type: boolean }
+        email_verified: { type: boolean }
+        phone_verified: { type: boolean }
+    Session:
+      type: object
+      required: [user, access_token, refresh_token, expires_in, token_type]
+      properties:
+        user: { $ref: "#/components/schemas/User" }
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_in: { type: integer }
+        token_type: { type: string, example: Bearer }
+    Location:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        label: { type: string, nullable: true }
+        address_text: { type: string, nullable: true }
+        locality_text: { type: string, nullable: true }
+        latitude: { type: number, nullable: true }
+        longitude: { type: number, nullable: true }
+        source: { type: string }
+        created_at: { type: string, format: date-time }
+    Organization:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        org_type: { type: string }
+        status: { type: string }
+        is_demo: { type: boolean }
+        member_role: { type: string }
+    Member:
+      type: object
+      properties:
+        user_id: { type: string, format: uuid }
+        email: { type: string }
+        display_name: { type: string }
+        member_role: { type: string }
+        status: { type: string }
+    Department:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+    Team:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        department_id: { type: string, format: uuid, nullable: true }
+    PrivacyRequest:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        request_type: { type: string }
+        status: { type: string }
+        created_at: { type: string, format: date-time }
+    AdminUser:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, nullable: true }
+        display_name: { type: string }
+        status: { type: string }
+        is_demo: { type: boolean }
+        roles:
+          type: array
+          items: { type: string }
+        created_at: { type: string, format: date-time }
+    AuditRecord:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        actor_user_id: { type: string, format: uuid, nullable: true }
+        actor_role: { type: string }
+        action: { type: string }
+        resource_type: { type: string }
+        resource_id: { type: string, format: uuid, nullable: true }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        request_id: { type: string }
+        metadata: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+    OtpRequest:
+      type: object
+      required: [phone]
+      properties:
+        phone: { type: string, description: E.164 phone number }
+        purpose: { type: string, enum: [login, verify_phone] }
+    OtpVerify:
+      allOf:
+        - $ref: "#/components/schemas/OtpRequest"
+        - type: object
+          required: [code]
+          properties:
+            code: { type: string }

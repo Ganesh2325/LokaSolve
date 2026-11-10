@@ -1,0 +1,139 @@
+# Local infrastructure for LokaSolve.
+# `docker compose up -d` starts data services.
+# Application processes can run on the host or with `--profile app`.
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.5
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: lokasolve
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d lokasolve"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: lokasolve
+      MINIO_ROOT_PASSWORD: lokasolve-dev-only
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 lokasolve lokasolve-dev-only; do sleep 1; done;
+      mc mb --ignore-existing local/lokasolve-media;
+      mc anonymous set none local/lokasolve-media;
+      exit 0;
+      "
+
+  api:
+    profiles: ["app"]
+    build:
+      context: ./services/api-go
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ENV: development
+      HTTP_ADDR: ":8080"
+      AUTO_MIGRATE: "true"
+      MIGRATE_DATABASE_URL: postgres://postgres:postgres@postgres:5432/lokasolve?sslmode=disable
+      DATABASE_URL: postgres://lokasolve_app:lokasolve_app@postgres:5432/lokasolve?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      AUTH_TOKEN_SECRET: ${AUTH_TOKEN_SECRET:-change-me-to-a-random-string-at-least-32-chars}
+      OTP_PEPPER: ${OTP_PEPPER:-change-me-otp-pepper-at-least-32-chars}
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    profiles: ["app"]
+    build:
+      context: ./services/api-go
+    entrypoint: ["/worker"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ENV: development
+      DATABASE_URL: postgres://lokasolve_app:lokasolve_app@postgres:5432/lokasolve?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      AUTH_TOKEN_SECRET: ${AUTH_TOKEN_SECRET:-change-me-to-a-random-string-at-least-32-chars}
+      OTP_PEPPER: ${OTP_PEPPER:-change-me-otp-pepper-at-least-32-chars}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  ai:
+    profiles: ["app"]
+    build:
+      context: ./services/ai-python
+    environment:
+      AI_HTTP_ADDR: ":8090"
+    ports:
+      - "8090:8090"
+
+  web:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        API_PROXY_TARGET: http://gateway:8088
+    environment:
+      API_PROXY_TARGET: http://gateway:8088
+    ports:
+      - "3000:3000"
+    depends_on:
+      - gateway
+
+  gateway:
+    profiles: ["app"]
+    build:
+      context: ../lokasolve-api-gateway
+    environment:
+      HTTP_ADDR: ":8088"
+      UPSTREAM_URL: http://api:8080
+      CORS_ORIGINS: http://localhost:3000
+    ports:
+      - "8088:8088"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  miniodata:
