@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"lokasolve/services/api-go/internal/auth"
+	"lokasolve/services/api-go/internal/identitymode"
 	"lokasolve/services/api-go/internal/platform/httpx"
 	"lokasolve/services/api-go/internal/platform/validate"
 )
@@ -34,6 +35,9 @@ func (h Handler) me(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) update(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	var req struct {
 		DisplayName             *string          `json:"display_name"`
@@ -68,6 +72,9 @@ func (h Handler) locations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) createLocation(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	var req struct {
 		Label        *string  `json:"label"`
@@ -94,6 +101,9 @@ func (h Handler) createLocation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) deleteLocation(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	locationID, message := validate.ID(chi.URLParam(r, "locationID"))
 	if message != "" {
@@ -108,6 +118,9 @@ func (h Handler) deleteLocation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) deletion(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	request, err := h.Service.RequestDeletion(r.Context(), principal, httpx.RequestID(r.Context()))
 	if err != nil {

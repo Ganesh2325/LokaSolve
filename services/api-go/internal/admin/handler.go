@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"lokasolve/services/api-go/internal/auth"
+	"lokasolve/services/api-go/internal/identitymode"
 	"lokasolve/services/api-go/internal/platform/httpx"
 	"lokasolve/services/api-go/internal/platform/validate"
 )
@@ -31,6 +32,9 @@ func (h Handler) users(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) grant(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	userID, message := validate.ID(chi.URLParam(r, "userID"))
 	if message != "" {

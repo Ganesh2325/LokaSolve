@@ -25,3 +25,13 @@ vendor/
 .DS_Store
 Thumbs.db
 *.log
+
+# Colocated repositories. Each one keeps its own git history.
+/services/identity-service/
+/services/issue-service/
+/services/taxonomy-service/
+/services/geospatial-service/
+/services/incident-service/
+/services/api-gateway/
+/contracts/
+/infrastructure/

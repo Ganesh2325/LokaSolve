@@ -22,6 +22,7 @@ func (h Handler) Routes(r chi.Router) {
 	r.Get("/admin/referrals", h.referrals)
 	r.Get("/issues/{issueID}/authorities", h.match)
 	r.Get("/issues/{issueID}/referrals", h.issueReferrals)
+	r.Get("/issues/{issueID}/progress", h.progress)
 	r.Post("/issues/{issueID}/referrals", h.prepare)
 	r.Post("/referrals/{referralID}/advance", h.advance)
 	r.Post("/referrals/{referralID}/escalate", h.escalate)
@@ -141,6 +142,21 @@ func (h Handler) issueReferrals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"data": items})
+}
+
+func (h Handler) progress(w http.ResponseWriter, r *http.Request) {
+	principal, _ := auth.Current(r.Context())
+	id, err := uuid.Parse(chi.URLParam(r, "issueID"))
+	if err != nil {
+		httpx.WriteError(w, r, httpx.New(400, "validation_error", "That report id is not valid."))
+		return
+	}
+	item, err := h.Service.Progress(r.Context(), principal, id)
+	if err != nil {
+		httpx.WriteError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, item)
 }
 
 func (h Handler) prepare(w http.ResponseWriter, r *http.Request) {

@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"lokasolve/services/api-go/internal/auth"
+	"lokasolve/services/api-go/internal/issuemode"
 	"lokasolve/services/api-go/internal/platform/httpx"
 )
 
@@ -34,12 +35,17 @@ func (h Handler) Routes(r chi.Router) {
 	r.Post("/issues/{issueID}/assignments", h.offer)
 	r.Post("/issues/{issueID}/actions", h.action)
 	r.Get("/admin/reviews", h.reviews)
+	r.Get("/admin/reviews/{reviewID}/events", h.reviewEvents)
+	r.Post("/admin/reviews/{reviewID}/decision", h.decideReview)
 	r.Post("/admin/reviews/{reviewID}/resolve", h.resolveReview)
 	r.Post("/admin/resolvers", h.addResolver)
 	r.Get("/admin/analytics", h.analytics)
 }
 
 func (h Handler) nearby(w http.ResponseWriter, r *http.Request) {
+	if issuemode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	items, err := h.Service.Nearby(r.Context(), principal)
 	if err != nil {
@@ -156,6 +162,9 @@ func (h Handler) timeline(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) listMedia(w http.ResponseWriter, r *http.Request) {
+	if issuemode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	id, err := parseID(r, "issueID")
 	if err != nil {
@@ -171,6 +180,9 @@ func (h Handler) listMedia(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) saveMedia(w http.ResponseWriter, r *http.Request) {
+	if issuemode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	id, err := parseID(r, "issueID")
 	if err != nil {
@@ -201,6 +213,9 @@ func (h Handler) saveMedia(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) openMedia(w http.ResponseWriter, r *http.Request) {
+	if issuemode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	issueID, err := parseID(r, "issueID")
 	if err != nil {
@@ -227,6 +242,9 @@ func (h Handler) openMedia(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) classify(w http.ResponseWriter, r *http.Request) {
+	if issuemode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	id, err := parseID(r, "issueID")
 	if err != nil {
@@ -348,6 +366,45 @@ func (h Handler) resolveReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h Handler) decideReview(w http.ResponseWriter, r *http.Request) {
+	principal, _ := auth.Current(r.Context())
+	id, err := uuid.Parse(chi.URLParam(r, "reviewID"))
+	if err != nil {
+		httpx.WriteError(w, r, httpx.New(400, "validation_error", "That review id is not valid."))
+		return
+	}
+	var req struct {
+		Decision   string `json:"decision"`
+		Note       string `json:"note"`
+		Department string `json:"suggested_department"`
+		Severity   string `json:"severity"`
+	}
+	if err := httpx.Decode(r, &req); err != nil {
+		httpx.WriteError(w, r, err)
+		return
+	}
+	if err := h.Service.DecideReview(r.Context(), principal, id, req.Decision, req.Note, req.Department, req.Severity); err != nil {
+		httpx.WriteError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h Handler) reviewEvents(w http.ResponseWriter, r *http.Request) {
+	principal, _ := auth.Current(r.Context())
+	id, err := uuid.Parse(chi.URLParam(r, "reviewID"))
+	if err != nil {
+		httpx.WriteError(w, r, httpx.New(400, "validation_error", "That review id is not valid."))
+		return
+	}
+	items, err := h.Service.ReviewEvents(r.Context(), principal, id)
+	if err != nil {
+		httpx.WriteError(w, r, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"data": items})
 }
 
 func (h Handler) addResolver(w http.ResponseWriter, r *http.Request) {

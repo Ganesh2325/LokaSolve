@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"lokasolve/services/api-go/internal/events"
 	"lokasolve/services/api-go/internal/identity"
+	"lokasolve/services/api-go/internal/identityclient"
 	"lokasolve/services/api-go/internal/platform/audit"
 	"lokasolve/services/api-go/internal/platform/authn"
 	"lokasolve/services/api-go/internal/platform/database"
@@ -52,6 +53,7 @@ type Service struct {
 	Limiter          ratelimit.Limiter
 	LockoutThreshold int
 	LockoutFor       time.Duration
+	Remote           *identityclient.Client
 }
 
 func (s *Service) Register(ctx context.Context, in RegisterInput, requestHash, idemKey string, meta Meta) (views.Session, error) {
@@ -312,6 +314,12 @@ func (s *Service) Login(ctx context.Context, email, password string, meta Meta) 
 	return session, nil
 }
 
+// refreshGrace is the overlap for one legitimate rotation. A second request that
+// is still holding the token just replaced joins that rotation. A later replay,
+// a revoked session, or a successor that has itself been replaced still revokes
+// the family. Expired tokens are rejected and do not revoke other sessions.
+const refreshGrace = 30 * time.Second
+
 func (s *Service) Refresh(ctx context.Context, refreshToken string, meta Meta) (views.Session, error) {
 	if refreshToken == "" {
 		return views.Session{}, errInvalidSession
@@ -323,10 +331,12 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string, meta Meta) (
 		var expires time.Time
 		var revokedAt *time.Time
 		var replacedBy *uuid.UUID
+		var sealed *string
 		err := tx.QueryRow(ctx, `
-			SELECT id, user_id, expires_at, revoked_at, replaced_by
+			SELECT id, user_id, expires_at, revoked_at, replaced_by, successor_refresh_sealed
 			FROM sessions WHERE refresh_token_hash = $1
-		`, authn.HashRefresh(refreshToken)).Scan(&sessionID, &userID, &expires, &revokedAt, &replacedBy)
+			FOR UPDATE
+		`, authn.HashRefresh(refreshToken)).Scan(&sessionID, &userID, &expires, &revokedAt, &replacedBy, &sealed)
 		if errors.Is(err, pgx.ErrNoRows) {
 			failure = errInvalidSession
 			return nil
@@ -335,7 +345,17 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string, meta Meta) (
 			return err
 		}
 		if revokedAt != nil || replacedBy != nil {
-			if _, err := tx.Exec(ctx, `UPDATE sessions SET revoked_at = COALESCE(revoked_at, now()) WHERE user_id = $1`, userID); err != nil {
+			if joined, ok, err := s.joinRecentRotation(ctx, tx, userID, revokedAt, replacedBy, sealed); err != nil {
+				return err
+			} else if ok {
+				session = joined
+				return nil
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE sessions
+				SET revoked_at = COALESCE(revoked_at, now()), successor_refresh_sealed = NULL
+				WHERE user_id = $1
+			`, userID); err != nil {
 				return err
 			}
 			if err := audit.Write(ctx, tx, audit.Entry{
@@ -363,9 +383,15 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string, meta Meta) (
 		if err != nil {
 			return err
 		}
+		sealedToken, err := s.Tokens.Seal(issued.RefreshToken)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `
-			UPDATE sessions SET revoked_at = now(), replaced_by = $2 WHERE id = $1
-		`, sessionID, issued.sessionID); err != nil {
+			UPDATE sessions
+			SET revoked_at = now(), replaced_by = $2, successor_refresh_sealed = $3
+			WHERE id = $1
+		`, sessionID, issued.sessionID, sealedToken); err != nil {
 			return err
 		}
 		user, err := identity.LoadUser(ctx, tx, userID)
@@ -383,6 +409,53 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string, meta Meta) (
 		return views.Session{}, failure
 	}
 	return session, nil
+}
+
+func (s *Service) joinRecentRotation(ctx context.Context, tx pgx.Tx, userID uuid.UUID, revokedAt *time.Time, replacedBy *uuid.UUID, sealed *string) (views.Session, bool, error) {
+	if replacedBy == nil || revokedAt == nil || sealed == nil || *sealed == "" {
+		return views.Session{}, false, nil
+	}
+	if time.Since(*revokedAt) > refreshGrace {
+		return views.Session{}, false, nil
+	}
+	var successorExpires time.Time
+	var successorRevoked *time.Time
+	var successorReplaced *uuid.UUID
+	err := tx.QueryRow(ctx, `
+		SELECT expires_at, revoked_at, replaced_by FROM sessions WHERE id = $1 FOR UPDATE
+	`, *replacedBy).Scan(&successorExpires, &successorRevoked, &successorReplaced)
+	if err != nil {
+		return views.Session{}, false, nil
+	}
+	if successorRevoked != nil || successorReplaced != nil || time.Now().After(successorExpires) {
+		return views.Session{}, false, nil
+	}
+	raw, err := s.Tokens.Open(*sealed)
+	if err != nil {
+		return views.Session{}, false, nil
+	}
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM users WHERE id = $1`, userID).Scan(&status); err != nil {
+		return views.Session{}, false, err
+	}
+	if status == "deleted" || status == "locked" {
+		return views.Session{}, false, nil
+	}
+	access, err := s.Tokens.IssueAccess(userID, *replacedBy)
+	if err != nil {
+		return views.Session{}, false, err
+	}
+	user, err := identity.LoadUser(ctx, tx, userID)
+	if err != nil {
+		return views.Session{}, false, err
+	}
+	return views.Session{
+		User:         user,
+		AccessToken:  access,
+		RefreshToken: raw,
+		ExpiresIn:    int(s.Tokens.AccessTTL().Seconds()),
+		TokenType:    "Bearer",
+	}, true, nil
 }
 
 func (s *Service) Logout(ctx context.Context, refreshToken string, meta Meta) error {

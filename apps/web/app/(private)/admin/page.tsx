@@ -7,7 +7,16 @@ import { useAuth } from "@/lib/auth";
 
 type ListedUser = { id: string; email: string | null; display_name: string; status: string; is_demo: boolean };
 type Analytics = { reports: number; open_reviews: number; awaiting_acceptance: number; awaiting_confirmation: number; resolved: number; older_than_48_hours: number; public_nearby: number; external_messages_ready: number };
-type Review = { id: string; issue_id: string; reason: string };
+type Review = {
+  id: string;
+  issue_id: string;
+  reason: string;
+  status: string;
+  severity: string | null;
+  geographic_area: string | null;
+  suggested_department: string | null;
+  deadline_at: string | null;
+};
 
 export default function OperationsPage() {
   const { token, user } = useAuth();
@@ -23,8 +32,11 @@ export default function OperationsPage() {
   const [resolverEmail, setResolverEmail] = useState("");
   const [stats, setStats] = useState<Analytics | null>(null);
   const [reviews, setReviews] = useState<Review[]>([]);
+  const [decisionNote, setDecisionNote] = useState("");
   const [saved, setSaved] = useState("");
   const [taxonomyError, setTaxonomyError] = useState("");
+  const [categories, setCategories] = useState<Array<{ id: string; name: string; status?: string; problem_types: Array<{ id: string; name: string; schema_version?: number }> }>>([]);
+  const [draftNames, setDraftNames] = useState<Record<string, string>>({});
   const canManageTypes = user?.roles.includes("super_admin") ?? false;
 
   useEffect(() => {
@@ -34,7 +46,24 @@ export default function OperationsPage() {
       .catch((caught) => setError(caught instanceof ApiError ? caught.message : "Could not load accounts."));
     api<Analytics>("/api/v1/admin/analytics", { token }).then(setStats).catch(() => setStats(null));
     api<{ data: Review[] }>("/api/v1/admin/reviews", { token }).then((response) => setReviews(response.data)).catch(() => setReviews([]));
+    api<{ data: Array<{ id: string; name: string; status?: string; problem_types: Array<{ id: string; name: string }> }> }>("/api/v1/taxonomy?include=archived", { token })
+      .then((response) => setCategories(response.data))
+      .catch(() => setCategories([]));
   }, [token]);
+
+  async function decide(id: string, decision: string, severity?: string) {
+    setError("");
+    try {
+      await api(`/api/v1/admin/reviews/${id}/decision`, {
+        method: "POST",
+        token,
+        body: { decision, note: decisionNote, suggested_department: "", severity: severity ?? "" },
+      });
+      setReviews((current) => current.map((review) => review.id === id ? { ...review, status: decision } : review));
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : "Could not save the review decision.");
+    }
+  }
 
   async function addType(event: React.FormEvent) {
     event.preventDefault();
@@ -49,6 +78,8 @@ export default function OperationsPage() {
       setSaved(`${categoryName} · ${typeName} is available on the report form.`);
       setTypeName("");
       setPrompt("");
+      const listed = await api<{ data: Array<{ id: string; name: string; status?: string; problem_types: Array<{ id: string; name: string }> }> }>("/api/v1/taxonomy?include=archived", { token });
+      setCategories(listed.data);
     } catch (caught) {
       setTaxonomyError(caught instanceof ApiError ? caught.message : "Could not save the problem type.");
     }
@@ -77,6 +108,55 @@ export default function OperationsPage() {
             {saved ? <p className="text-sm font-semibold">{saved}</p> : null}
             <Button type="submit">Add type</Button>
           </form>
+          {categories.length > 0 ? (
+            <ul className="mt-4 flex flex-col gap-2 text-sm">
+              {categories.map((item) => (
+                <li key={item.id} className="flex flex-col gap-2 border-t border-ink pt-2">
+                  <span>{item.name} · {item.status === "archived" ? "archived" : "active"} · {item.problem_types.map((problem) => `${problem.name}${problem.schema_version ? ` v${problem.schema_version}` : ""}`).join(", ") || "no problem types"}</span>
+                  {item.status !== "archived" ? (
+                    <div className="flex flex-wrap gap-2">
+                      <input className={controlClass} value={draftNames[item.id] ?? item.name} aria-label={`Revised name for ${item.name}`} onChange={(event) => setDraftNames((current) => ({ ...current, [item.id]: event.target.value }))} />
+                      <button
+                        type="button"
+                        className="btn btn-line"
+                        onClick={async () => {
+                          setTaxonomyError("");
+                          try {
+                            await api(`/api/v1/taxonomy/categories/${item.id}`, { method: "PATCH", token, body: { name: draftNames[item.id] ?? item.name, locale: "en", description: "" } });
+                            const listed = await api<{ data: typeof categories }>("/api/v1/taxonomy?include=archived", { token });
+                            setCategories(listed.data);
+                            setSaved(`${item.name} was updated.`);
+                          } catch (caught) {
+                            setTaxonomyError(caught instanceof ApiError ? caught.message : "Could not update the category.");
+                          }
+                        }}
+                      >
+                        Save name
+                      </button>
+                    </div>
+                  ) : null}
+                  {item.status !== "archived" ? (
+                    <button
+                      type="button"
+                      className="btn btn-line"
+                      onClick={async () => {
+                        setTaxonomyError("");
+                        try {
+                          await api(`/api/v1/taxonomy/categories/${item.id}/archive`, { method: "POST", token });
+                          setCategories((current) => current.map((category) => category.id === item.id ? { ...category, status: "archived" } : category));
+                          setSaved(`${item.name} is archived. Older reports still keep this category.`);
+                        } catch (caught) {
+                          setTaxonomyError(caught instanceof ApiError ? caught.message : "Could not archive the category.");
+                        }
+                      }}
+                    >
+                      Archive
+                    </button>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          ) : null}
         </Card>
       ) : null}
       {stats ? (
@@ -89,7 +169,7 @@ export default function OperationsPage() {
             ["Resolved", stats.resolved],
             ["Open over 48 hours", stats.older_than_48_hours],
             ["Public nearby", stats.public_nearby],
-            ["External messages sent", stats.external_messages_ready],
+            ["External messages recorded", stats.external_messages_ready],
           ].map(([label, value]) => (
             <Card key={label}>
               <p className="text-xs font-bold uppercase">{label}</p>
@@ -126,8 +206,18 @@ export default function OperationsPage() {
           <ul className="mt-3 flex flex-col gap-3">
             {reviews.map((item) => (
               <li key={item.id} className="text-sm">
-                <p>{item.reason}</p>
-                <Button className="mt-2" onClick={() => api(`/api/v1/admin/reviews/${item.id}/resolve`, { method: "POST", token }).then(() => setReviews((current) => current.filter((review) => review.id !== item.id)))}>Reviewed</Button>
+                <p className="font-semibold">{item.severity ?? "Unclassified"} · {item.status.replaceAll("_", " ")}</p>
+                <p className="mt-1">{item.reason}</p>
+                <p className="mt-1">{item.geographic_area ?? "No area recorded"} · {item.suggested_department ?? "No department suggested"}</p>
+                <p className="mt-1">Review again {item.deadline_at ? new Date(item.deadline_at).toLocaleString() : "with no deadline"}</p>
+                <input className={`${controlClass} mt-2`} value={decisionNote} onChange={(event) => setDecisionNote(event.target.value)} placeholder="Reason for the decision" aria-label="Review note" />
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button onClick={() => decide(item.id, "confirm_routing")}>Confirm routing</Button>
+                  <Button onClick={() => decide(item.id, "request_information")}>Ask for information</Button>
+                  <Button onClick={() => decide(item.id, "escalate")}>Escalate</Button>
+                  <Button onClick={() => decide(item.id, "reject_classification", "P3")}>Reject classification</Button>
+                  <Button onClick={() => decide(item.id, "no_destination")}>No verified destination</Button>
+                </div>
               </li>
             ))}
           </ul>

@@ -6,6 +6,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"lokasolve/services/api-go/internal/auth"
+	"lokasolve/services/api-go/internal/identitymode"
 	"lokasolve/services/api-go/internal/platform/httpx"
 	"lokasolve/services/api-go/internal/platform/validate"
 )
@@ -37,6 +38,9 @@ func (h Handler) mine(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) create(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	var req struct {
 		Name string `json:"name"`
@@ -85,6 +89,9 @@ func (h Handler) members(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) addMember(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	orgID, ok := pathID(w, r, "organizationID")
 	if !ok {
@@ -108,6 +115,9 @@ func (h Handler) addMember(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) removeMember(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	orgID, ok := pathID(w, r, "organizationID")
 	if !ok {
@@ -139,6 +149,9 @@ func (h Handler) departments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) createDepartment(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	orgID, ok := pathID(w, r, "organizationID")
 	if !ok {
@@ -160,6 +173,9 @@ func (h Handler) createDepartment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) createTeam(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	orgID, ok := pathID(w, r, "organizationID")
 	if !ok {

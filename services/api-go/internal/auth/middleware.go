@@ -21,6 +21,10 @@ func Current(ctx context.Context) (authn.Principal, bool) {
 
 func (s *Service) Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.Remote != nil {
+			s.authenticateRemote(w, r, next)
+			return
+		}
 		raw := httpx.Bearer(r)
 		if raw == "" {
 			httpx.WriteError(w, r, errInvalidSession)

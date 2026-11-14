@@ -12,6 +12,11 @@ import (
 	"lokasolve/services/api-go/internal/admin"
 	"lokasolve/services/api-go/internal/auth"
 	"lokasolve/services/api-go/internal/authority"
+	"lokasolve/services/api-go/internal/identityclient"
+	"lokasolve/services/api-go/internal/identitymode"
+	"lokasolve/services/api-go/internal/issuebridge"
+	"lokasolve/services/api-go/internal/issueclient"
+	"lokasolve/services/api-go/internal/issuemode"
 	"lokasolve/services/api-go/internal/issues"
 	"lokasolve/services/api-go/internal/organizations"
 	"lokasolve/services/api-go/internal/platform/authn"
@@ -38,10 +43,25 @@ func New(cfg config.Config, db *database.DB, rdb *redis.Client, sender authn.Sen
 	if limiter == nil {
 		limiter = ratelimit.NewMemory()
 	}
+	if cfg.IdentityWritesClosed || cfg.IdentityBaseURL != "" {
+		identitymode.WritesClosed = true
+	}
+	if cfg.IssueWritesClosed || cfg.IssueBaseURL != "" {
+		issuemode.WritesClosed = true
+	}
+	var remote *identityclient.Client
+	if cfg.IdentityBaseURL != "" {
+		remote = identityclient.New(cfg.IdentityBaseURL, cfg.IdentityServiceToken)
+	}
+	var issuesRemote *issueclient.Client
+	if cfg.IssueBaseURL != "" {
+		issuesRemote = issueclient.New(cfg.IssueBaseURL, cfg.IssueServiceToken)
+	}
 	authService := &auth.Service{
 		DB: db, Tokens: authn.NewTokenManager(cfg.AuthTokenSecret, cfg.AccessTokenTTL, cfg.RefreshTokenTTL),
 		OTP: sender, Pepper: cfg.OTPPepper, Limiter: limiter,
 		LockoutThreshold: cfg.LockoutThreshold, LockoutFor: cfg.LockoutDuration,
+		Remote: remote,
 	}
 	userService := &users.Service{DB: db}
 	orgService := &organizations.Service{DB: db}
@@ -89,14 +109,15 @@ func New(cfg config.Config, db *database.DB, rdb *redis.Client, sender authn.Sen
 			users.Handler{Service: userService}.Routes(r)
 			issues.Handler{Service: &issues.Service{DB: db}}.Routes(r)
 			taxonomy.Handler{Service: &taxonomy.Service{DB: db}}.Routes(r)
-			workflow.Handler{Service: &workflow.Service{DB: db}}.Routes(r)
-			authority.Handler{Service: &authority.Service{DB: db}}.Routes(r)
+			workflow.Handler{Service: &workflow.Service{DB: db, Issue: issuesRemote}}.Routes(r)
+			authority.Handler{Service: &authority.Service{DB: db, Issue: issuesRemote}}.Routes(r)
 			organizations.Handler{Service: orgService}.Routes(r)
 			admin.Handler{Service: adminService}.Routes(r)
 			r.Post("/me/phone/otp/request", authHandler.RequestPhoneOTP)
 			r.Post("/me/phone/otp/verify", authHandler.VerifyPhoneOTP)
 		})
 	})
+	issuebridge.Handler{DB: db, Token: cfg.IssueServiceToken}.Mount(router)
 	return &App{Handler: router, DB: db, Redis: rdb, Auth: authService}
 }
 

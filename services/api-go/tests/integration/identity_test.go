@@ -134,6 +134,15 @@ func TestRefreshReuseRevokesTheFamily(t *testing.T) {
 	reset(t)
 	first := register(t, "refresh@example.com", "resident", "", "")
 	second := refresh(t, first.RefreshToken)
+	// A second presentation inside the overlap joins the rotation that just happened.
+	joined := refresh(t, first.RefreshToken)
+	if joined.RefreshToken != second.RefreshToken {
+		t.Fatal("overlapping refresh minted a second session")
+	}
+	if post(t, "/api/v1/auth/refresh", map[string]string{"refresh_token": second.RefreshToken}, "") != http.StatusOK {
+		t.Fatal("successor refresh failed")
+	}
+	// The original token is now a replay: its successor was rotated again.
 	reused := post(t, "/api/v1/auth/refresh", map[string]string{"refresh_token": first.RefreshToken}, "")
 	if reused != http.StatusUnauthorized {
 		t.Fatalf("reused status %d", reused)

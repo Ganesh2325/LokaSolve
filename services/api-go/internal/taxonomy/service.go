@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"lokasolve/services/api-go/internal/events"
 	"lokasolve/services/api-go/internal/platform/audit"
 	"lokasolve/services/api-go/internal/platform/authn"
 	"lokasolve/services/api-go/internal/platform/database"
@@ -124,6 +125,11 @@ func (s *Service) AddProblemType(ctx context.Context, principal authn.Principal,
 		}
 		id, _ := uuid.Parse(created.ID)
 		created.Fields = defs
+		if err := events.Enqueue(ctx, tx, "taxonomy", id, "taxonomy.updated", map[string]any{
+			"problem_type_id": created.ID, "category_id": categoryID.String(), "name": created.Name,
+		}); err != nil {
+			return err
+		}
 		return audit.Write(ctx, tx, audit.Entry{
 			ActorID: &principal.UserID, ActorRole: "operator", Action: "taxonomy.problem_type_upsert",
 			ResourceType: "problem_type", ResourceID: &id, RequestID: requestID,

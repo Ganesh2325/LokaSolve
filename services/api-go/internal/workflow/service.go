@@ -9,7 +9,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"lokasolve/services/api-go/internal/events"
 	"lokasolve/services/api-go/internal/identity"
+	"lokasolve/services/api-go/internal/issueclient"
 	"lokasolve/services/api-go/internal/platform/audit"
 	"lokasolve/services/api-go/internal/platform/authn"
 	"lokasolve/services/api-go/internal/platform/database"
@@ -19,6 +21,7 @@ import (
 type Service struct {
 	DB      *database.DB
 	Scanner MalwareScanner
+	Issue   *issueclient.Client
 }
 
 type TimelineItem struct {
@@ -79,10 +82,17 @@ type Notice struct {
 }
 
 type ReviewItem struct {
-	ID      string `json:"id"`
-	IssueID string `json:"issue_id"`
-	Reason  string `json:"reason"`
-	Status  string `json:"status"`
+	ID                  string     `json:"id"`
+	IssueID             string     `json:"issue_id"`
+	Reason              string     `json:"reason"`
+	Status              string     `json:"status"`
+	Severity            *string    `json:"severity"`
+	GeographicArea      *string    `json:"geographic_area"`
+	SuggestedDepartment *string    `json:"suggested_department"`
+	ReportExcerpt       *string    `json:"report_excerpt"`
+	DeadlineAt          *time.Time `json:"deadline_at"`
+	Decision            *string    `json:"decision"`
+	DecisionNote        *string    `json:"decision_note"`
 }
 
 type Analytics struct {
@@ -116,7 +126,31 @@ func (s *Service) Timeline(ctx context.Context, principal authn.Principal, issue
 		}
 		return rows.Err()
 	})
-	return items, err
+	if err != nil || s.Issue == nil {
+		return items, err
+	}
+	var visible bool
+	err = s.DB.WithFlags(ctx, &principal.UserID, identity.AccessFlags(principal), func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM issue_visible($1))`, issueID).Scan(&visible)
+	})
+	if err != nil || !visible {
+		return items, err
+	}
+	remote, remoteErr := s.Issue.Events(ctx, issueID)
+	if remoteErr != nil {
+		return nil, remoteErr
+	}
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		seen[item.ID] = struct{}{}
+	}
+	for _, item := range remote {
+		if _, ok := seen[item.ID]; ok {
+			continue
+		}
+		items = append(items, TimelineItem{ID: item.ID, Kind: item.Kind, Body: item.Body, CreatedAt: item.CreatedAt})
+	}
+	return items, nil
 }
 
 func (s *Service) SaveMedia(ctx context.Context, principal authn.Principal, issueID uuid.UUID, fileName, declared string, body []byte) (MediaItem, error) {
@@ -156,6 +190,11 @@ func (s *Service) SaveMedia(ctx context.Context, principal authn.Principal, issu
 			INSERT INTO media_objects (id, issue_id, owner_user_id, file_name, content_type, byte_size, content, malware_scan)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		`, id, issueID, principal.UserID, storedName, contentType, len(body), body, scan.Status); err != nil {
+			return err
+		}
+		if err := events.Enqueue(ctx, tx, "issue", issueID, "media.attached", map[string]any{
+			"issue_id": issueID.String(), "media_id": item.ID, "content_type": contentType, "byte_size": len(body), "malware_scan": scan.Status,
+		}); err != nil {
 			return err
 		}
 		return Record(ctx, tx, principal.UserID, issueID, principal.UserID, "media", "A file was added to this report. It has not been malware-scanned.", "File added")
@@ -270,6 +309,11 @@ func (s *Service) Classify(ctx context.Context, principal authn.Principal, issue
 		if err := Record(ctx, tx, principal.UserID, issueID, reporter, "classification", "The label was set to "+label+".", "Label updated"); err != nil {
 			return err
 		}
+		if err := events.Enqueue(ctx, tx, "issue", issueID, "issue.updated", map[string]any{
+			"issue_id": issueID.String(), "category_label": label, "status": "UNDER_REVIEW",
+		}); err != nil {
+			return err
+		}
 		return audit.Write(ctx, tx, audit.Entry{
 			ActorID: &principal.UserID, ActorRole: "reporter", Action: "issue.classify",
 			ResourceType: "issue", ResourceID: &issueID, RequestID: requestID,
@@ -285,7 +329,7 @@ func (s *Service) CreateIncident(ctx context.Context, principal authn.Principal,
 		var locality *string
 		var reporter uuid.UUID
 		err := tx.QueryRow(ctx, `
-			SELECT COALESCE(category_label, 'Local report'), locality_text, reporter_user_id FROM issues WHERE id = $1
+			SELECT COALESCE(category_label, 'Local report'), locality_text, reporter_user_id FROM issue_visible($1)
 		`, issueID).Scan(&title, &locality, &reporter)
 		if err == pgx.ErrNoRows {
 			return httpx.New(404, "not_found", "That report is not available.")
@@ -367,8 +411,7 @@ func (s *Service) AddResolver(ctx context.Context, principal authn.Principal, na
 func (s *Service) Eligible(ctx context.Context, principal authn.Principal, issueID uuid.UUID) ([]Resolver, error) {
 	found := []Resolver{}
 	err := s.DB.WithFlags(ctx, &principal.UserID, identity.AccessFlags(principal), func(tx pgx.Tx) error {
-		var category, locality, description *string
-		err := tx.QueryRow(ctx, `SELECT category_label, locality_text, description FROM issues WHERE id = $1`, issueID).Scan(&category, &locality, &description)
+		report, err := LoadRouteReport(ctx, tx, issueID)
 		if err == pgx.ErrNoRows {
 			return httpx.New(404, "not_found", "That report is not available.")
 		}
@@ -388,30 +431,22 @@ func (s *Service) Eligible(ctx context.Context, principal authn.Principal, issue
 			if err := rows.Scan(&item.ID, &item.DisplayName, &item.Kind, &item.LocalityText, &item.Skills, &item.VerificationStatus); err != nil {
 				return err
 			}
-			if explanation, ok := eligible(item, category, locality); ok {
-				item.Explanation = explanation
-				found = append(found, item)
+			decision := DecideRoute(report, providerTarget(item, report))
+			if !decision.Recommend {
+				continue
 			}
+			item.Explanation = strings.Join(decision.Reasons, " ")
+			found = append(found, item)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if len(found) == 0 {
+			return OpenReview(ctx, tx, issueID, providerReviewReason(report))
+		}
+		return nil
 	})
 	return found, err
-}
-
-func eligible(item Resolver, category, locality *string) (string, bool) {
-	reasons := []string{}
-	if category != nil && *category != "" && strings.Contains(strings.ToLower(item.Skills), strings.ToLower(*category)) {
-		reasons = append(reasons, "skills include "+*category)
-	}
-	if locality != nil && item.LocalityText != nil && *locality != "" && *item.LocalityText != "" &&
-		(strings.Contains(strings.ToLower(*locality), strings.ToLower(*item.LocalityText)) || strings.Contains(strings.ToLower(*item.LocalityText), strings.ToLower(*locality))) {
-		reasons = append(reasons, "covers "+*item.LocalityText)
-	}
-	if len(reasons) == 0 {
-		return "", false
-	}
-	note := "Eligible because " + strings.Join(reasons, " and ") + ". Verification is " + item.VerificationStatus + ". No offer has been sent by this check."
-	return note, true
 }
 
 func (s *Service) Offer(ctx context.Context, principal authn.Principal, issueID, resolverID uuid.UUID, requestID string) (Assignment, error) {
@@ -419,23 +454,37 @@ func (s *Service) Offer(ctx context.Context, principal authn.Principal, issueID,
 		return Assignment{}, httpx.New(403, "forbidden", "You do not have access to that action.")
 	}
 	var created Assignment
+	var held string
 	err := s.DB.WithFlags(ctx, &principal.UserID, []string{"app.platform_admin"}, func(tx pgx.Tx) error {
-		matches, err := loadEligible(ctx, tx, issueID)
+		report, err := LoadRouteReport(ctx, tx, issueID)
+		if err == pgx.ErrNoRows {
+			return httpx.New(404, "not_found", "That report is not available.")
+		}
 		if err != nil {
 			return err
 		}
-		var chosen *Resolver
-		for i := range matches {
-			if matches[i].ID == resolverID.String() {
-				chosen = &matches[i]
-				break
-			}
-		}
-		if chosen == nil {
+		var chosen Resolver
+		err = tx.QueryRow(ctx, `
+			SELECT id::text, display_name, kind, locality_text, skills, verification_status
+			FROM resolvers WHERE id = $1 AND active
+		`, resolverID).Scan(&chosen.ID, &chosen.DisplayName, &chosen.Kind, &chosen.LocalityText, &chosen.Skills, &chosen.VerificationStatus)
+		if err == pgx.ErrNoRows {
 			return httpx.New(400, "validation_error", "That responder is not eligible for this report.")
 		}
+		if err != nil {
+			return err
+		}
+		decision := DecideRoute(report, providerTarget(chosen, report))
+		if !decision.Allow {
+			held = providerReviewReason(report)
+			return httpx.New(400, "validation_error", "A provider cannot be offered yet. The report stays in human review. Nothing was sent.")
+		}
+		chosen.Explanation = strings.Join(decision.Reasons, " ")
 		var reporter uuid.UUID
-		if err := tx.QueryRow(ctx, `SELECT reporter_user_id FROM issues WHERE id = $1`, issueID).Scan(&reporter); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT reporter_user_id FROM issue_visible($1)`, issueID).Scan(&reporter); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return httpx.New(404, "not_found", "That report is not available.")
+			}
 			return err
 		}
 		id := uuid.New()
@@ -446,7 +495,7 @@ func (s *Service) Offer(ctx context.Context, principal authn.Principal, issueID,
 		`, id, issueID, resolverID, chosen.Explanation); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE issues SET status = 'AWAITING_RESOLVER_ACCEPTANCE', updated_at = now() WHERE id = $1`, issueID); err != nil {
+		if err := s.writeStatus(ctx, tx, issueID, "AWAITING_RESOLVER_ACCEPTANCE"); err != nil {
 			return err
 		}
 		if err := Record(ctx, tx, principal.UserID, issueID, reporter, "offer", "An offer was recorded for "+chosen.DisplayName+". They have not accepted it.", "Offer recorded"); err != nil {
@@ -457,35 +506,12 @@ func (s *Service) Offer(ctx context.Context, principal authn.Principal, issueID,
 			ResourceType: "assignment", ResourceID: &id, RequestID: requestID,
 		})
 	})
+	if held != "" {
+		_ = s.DB.WithFlags(ctx, &principal.UserID, []string{"app.platform_admin"}, func(tx pgx.Tx) error {
+			return OpenReview(ctx, tx, issueID, held)
+		})
+	}
 	return created, err
-}
-
-func loadEligible(ctx context.Context, tx pgx.Tx, issueID uuid.UUID) ([]Resolver, error) {
-	var category, locality *string
-	var description string
-	if err := tx.QueryRow(ctx, `SELECT category_label, locality_text, description FROM issues WHERE id = $1`, issueID).Scan(&category, &locality, &description); err != nil {
-		if err == pgx.ErrNoRows {
-			return nil, httpx.New(404, "not_found", "That report is not available.")
-		}
-		return nil, err
-	}
-	rows, err := tx.Query(ctx, `SELECT id::text, display_name, kind, locality_text, skills, verification_status FROM resolvers WHERE active`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	found := []Resolver{}
-	for rows.Next() {
-		var item Resolver
-		if err := rows.Scan(&item.ID, &item.DisplayName, &item.Kind, &item.LocalityText, &item.Skills, &item.VerificationStatus); err != nil {
-			return nil, err
-		}
-		if explanation, ok := eligible(item, category, locality); ok {
-			item.Explanation = explanation
-			found = append(found, item)
-		}
-	}
-	return found, rows.Err()
 }
 
 func (s *Service) ListAssignments(ctx context.Context, principal authn.Principal) ([]Assignment, error) {
@@ -498,7 +524,7 @@ func (s *Service) ListAssignments(ctx context.Context, principal authn.Principal
 				COALESCE(r.owner_user_id = $1, false), COALESCE(i.reporter_user_id = $1, false)
 			FROM assignments a
 			JOIN resolvers r ON r.id = a.resolver_id
-			LEFT JOIN issues i ON i.id = a.issue_id
+			LEFT JOIN LATERAL issue_visible(a.issue_id) i ON true
 			ORDER BY a.created_at DESC LIMIT 100
 		`, principal.UserID)
 		if err != nil {
@@ -546,7 +572,7 @@ func (s *Service) Transition(ctx context.Context, principal authn.Principal, ass
 		err := tx.QueryRow(ctx, `
 			SELECT a.status, a.issue_id, i.reporter_user_id, r.owner_user_id IS NOT NULL, COALESCE(r.owner_user_id, '00000000-0000-0000-0000-000000000000')
 			FROM assignments a
-			JOIN issues i ON i.id = a.issue_id
+			JOIN LATERAL issue_visible(a.issue_id) i ON true
 			JOIN resolvers r ON r.id = a.resolver_id
 			WHERE a.id = $1
 		`, assignmentID).Scan(&current, &issueID, &reporter, &hasOwner, &owner)
@@ -591,7 +617,7 @@ func (s *Service) Transition(ctx context.Context, principal authn.Principal, ass
 		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE issues SET status = $2, updated_at = now() WHERE id = $1`, issueID, issueStatus[status]); err != nil {
+		if err := s.writeStatus(ctx, tx, issueID, issueStatus[status]); err != nil {
 			return err
 		}
 		body := "Assignment status is now " + strings.ReplaceAll(status, "_", " ") + "."
@@ -615,8 +641,9 @@ func (s *Service) ApproveQuote(ctx context.Context, principal authn.Principal, a
 		var quote *string
 		err := tx.QueryRow(ctx, `
 			SELECT a.issue_id, i.reporter_user_id, a.quote_text
-			FROM assignments a JOIN issues i ON i.id = a.issue_id
-			WHERE a.id = $1 AND i.reporter_user_id = $2
+			FROM assignments a
+			JOIN LATERAL issue_visible(a.issue_id) i ON i.reporter_user_id = $2
+			WHERE a.id = $1
 		`, assignmentID, principal.UserID).Scan(&issueID, &reporter, &quote)
 		if err == pgx.ErrNoRows {
 			return httpx.New(404, "not_found", "That quote is not available.")
@@ -654,7 +681,7 @@ func (s *Service) SetQuote(ctx context.Context, principal authn.Principal, assig
 		if err != nil {
 			return err
 		}
-		if err := tx.QueryRow(ctx, `SELECT reporter_user_id FROM issues WHERE id = $1`, issueID).Scan(&reporter); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT reporter_user_id FROM issue_visible($1)`, issueID).Scan(&reporter); err != nil {
 			return err
 		}
 		return Record(ctx, tx, principal.UserID, issueID, reporter, "quote", "A quote was recorded: "+quote+". It is not approved yet.", "Quote recorded")
@@ -710,8 +737,12 @@ func (s *Service) Reviews(ctx context.Context, principal authn.Principal) ([]Rev
 	items := []ReviewItem{}
 	err := s.DB.WithFlags(ctx, &principal.UserID, identity.AccessFlags(principal), func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			SELECT id::text, issue_id::text, reason, status FROM review_items
-			WHERE status = 'open' ORDER BY created_at DESC LIMIT 50
+			SELECT id::text, issue_id::text, reason, status, severity, geographic_area,
+				suggested_department, report_excerpt, deadline_at, decision, decision_note
+			FROM review_items
+			WHERE status <> 'resolved'
+			ORDER BY created_at DESC
+			LIMIT 100
 		`)
 		if err != nil {
 			return err
@@ -719,7 +750,10 @@ func (s *Service) Reviews(ctx context.Context, principal authn.Principal) ([]Rev
 		defer rows.Close()
 		for rows.Next() {
 			var item ReviewItem
-			if err := rows.Scan(&item.ID, &item.IssueID, &item.Reason, &item.Status); err != nil {
+			if err := rows.Scan(
+				&item.ID, &item.IssueID, &item.Reason, &item.Status, &item.Severity, &item.GeographicArea,
+				&item.SuggestedDepartment, &item.ReportExcerpt, &item.DeadlineAt, &item.Decision, &item.DecisionNote,
+			); err != nil {
 				return err
 			}
 			items = append(items, item)
@@ -762,7 +796,7 @@ func (s *Service) DigitalAction(ctx context.Context, principal authn.Principal, 
 	}
 	return s.DB.WithFlags(ctx, &principal.UserID, []string{"app.platform_admin"}, func(tx pgx.Tx) error {
 		var reporter uuid.UUID
-		err := tx.QueryRow(ctx, `SELECT reporter_user_id FROM issues WHERE id = $1`, issueID).Scan(&reporter)
+		err := tx.QueryRow(ctx, `SELECT reporter_user_id FROM issue_visible($1)`, issueID).Scan(&reporter)
 		if err == pgx.ErrNoRows {
 			return httpx.New(404, "not_found", "That report is not available.")
 		}
@@ -780,6 +814,22 @@ func (s *Service) DigitalAction(ctx context.Context, principal authn.Principal, 
 			return err
 		}
 		return Record(ctx, tx, principal.UserID, issueID, reporter, "digital", body, "Action recorded")
+	})
+}
+
+func (s *Service) writeStatus(ctx context.Context, tx pgx.Tx, issueID uuid.UUID, status string) error {
+	if s.Issue != nil {
+		if err := s.Issue.SetStatus(ctx, issueID, status); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE issue_projection SET status = $2, updated_at = now() WHERE id = $1`, issueID, status); err != nil {
+			return err
+		}
+	} else if _, err := tx.Exec(ctx, `UPDATE issues SET status = $2, updated_at = now() WHERE id = $1`, issueID, status); err != nil {
+		return err
+	}
+	return events.Enqueue(ctx, tx, "issue", issueID, "issue.status_changed", map[string]any{
+		"issue_id": issueID.String(), "status": status,
 	})
 }
 

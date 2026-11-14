@@ -60,6 +60,9 @@ export function PrivateShell({ children }: { children: React.ReactNode }) {
           <NavLink href="/reports/new" active={pathname === "/reports/new"}>
             {labels.reportProblem}
           </NavLink>
+          <NavLink href="/incidents" active={pathname === "/incidents" || pathname.startsWith("/incidents/")}>
+            Incidents
+          </NavLink>
           {operations.map((link) => (
             <NavLink key={link.href} href={link.href} active={pathname === link.href}>
               {link.label}
@@ -73,6 +76,7 @@ export function PrivateShell({ children }: { children: React.ReactNode }) {
       <div className="flex h-full min-h-0 min-w-0 flex-col">
         <header className="flex shrink-0 items-center justify-between border-b border-line bg-paper px-4 py-3 md:hidden">
           <Brand tone="dark" />
+          <Link href="/incidents" className="min-h-11 text-sm font-semibold">Incidents</Link>
           <button type="button" className="min-h-11 text-sm font-semibold" onClick={() => signOut().then(() => router.push("/"))}>
             {labels.signOut}
           </button>

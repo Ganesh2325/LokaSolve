@@ -69,11 +69,12 @@ export const platformSections: PlatformSection[] = [
     slug: "taxonomy",
     group: "Configuration",
     title: "Taxonomy and workflows",
-    state: "not_operating",
-    summary: "Categories, required fields, skills, and workflows are meant to be configuration, not a hardcoded list.",
+    state: "partial",
+    summary: "Categories and problem types are loaded from the taxonomy service. A report can still be saved with only a description.",
     points: [
-      "An administrator cannot yet add a problem type from the screen.",
+      "An administrator with taxonomy access can add a problem type and archive a category.",
       "The report form does not lock the person to one department.",
+      "Workflows and skills are not configured from this screen.",
     ],
   },
   {

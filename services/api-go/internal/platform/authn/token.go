@@ -1,6 +1,8 @@
 package authn
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -80,4 +82,43 @@ func NewRefreshToken() (string, string, error) {
 func HashRefresh(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
+}
+
+// Seal hides a successor refresh token for the short overlap window. The raw
+// token is not stored. The seal key is the hash of the access-token secret.
+func (m *TokenManager) Seal(raw string) (string, error) {
+	gcm, err := m.sealer()
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(gcm.Seal(nonce, nonce, []byte(raw), nil)), nil
+}
+
+func (m *TokenManager) Open(sealed string) (string, error) {
+	gcm, err := m.sealer()
+	if err != nil {
+		return "", err
+	}
+	buf, err := base64.RawURLEncoding.DecodeString(sealed)
+	if err != nil || len(buf) < gcm.NonceSize() {
+		return "", fmt.Errorf("invalid seal")
+	}
+	plain, err := gcm.Open(nil, buf[:gcm.NonceSize()], buf[gcm.NonceSize():], nil)
+	if err != nil {
+		return "", fmt.Errorf("invalid seal")
+	}
+	return string(plain), nil
+}
+
+func (m *TokenManager) sealer() (cipher.AEAD, error) {
+	key := sha256.Sum256(m.secret)
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
 }

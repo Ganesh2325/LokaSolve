@@ -25,9 +25,9 @@ func Enqueue(ctx context.Context, tx pgx.Tx, aggregateType string, aggregateID u
 		return err
 	}
 	_, err = tx.Exec(ctx, `
-		INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
-		VALUES ($1, $2, $3, $4)
-	`, aggregateType, aggregateID, eventType, raw)
+		INSERT INTO outbox_events (schema_version, aggregate_type, aggregate_id, aggregate_version, event_type, idempotency_key, payload)
+		VALUES (1, $1, $2, 1, $3, $4, $5)
+	`, aggregateType, aggregateID, eventType, uuid.NewString(), raw)
 	return err
 }
 

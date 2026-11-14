@@ -20,6 +20,7 @@ export type User = {
   status: string;
   is_demo: boolean;
   roles: string[];
+  permissions?: string[];
   notification_preferences: Record<string, boolean>;
   privacy_preferences: Record<string, boolean>;
   email_verified: boolean;
@@ -79,13 +80,23 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   return payload as T;
 }
 
+let refreshInFlight: Promise<Session | null> | null = null;
+
 export async function refreshSession(): Promise<Session | null> {
-  const response = await fetch("/api/v1/auth/refresh", {
-    method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json", "X-LokaSolve-Client": "web" },
-    body: "{}",
-  });
-  if (!response.ok) return null;
-  return (await response.json()) as Session;
+  if (!refreshInFlight) {
+    refreshInFlight = fetch("/api/v1/auth/refresh", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json", "X-LokaSolve-Client": "web" },
+      body: "{}",
+    })
+      .then(async (response) => {
+        if (!response.ok) return null;
+        return (await response.json()) as Session;
+      })
+      .finally(() => {
+        refreshInFlight = null;
+      });
+  }
+  return refreshInFlight;
 }

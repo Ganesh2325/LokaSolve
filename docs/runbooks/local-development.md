@@ -9,6 +9,22 @@
 
 PostgreSQL and Redis are not required on the host.
 
+## Layout
+
+The runnable services live in this repository tree and start together. Each extracted service keeps its own git history.
+
+| Path | Port |
+| --- | --- |
+| `services/api-go` | 8080 |
+| `services/api-gateway` | 8088 |
+| `services/identity-service` | 8090 |
+| `services/issue-service` | 8091 |
+| `services/taxonomy-service` | 8092 |
+| `services/geospatial-service` | 8094 |
+| `apps/web` | 3000 |
+| `contracts` | API contracts |
+| `infrastructure` | Infrastructure notes and compose docs |
+
 ## Start data services
 
 From the repository root:
@@ -62,7 +78,7 @@ Open `http://localhost:3000`. Registration says that email is not verified. Near
 `API_PROXY_TARGET` in the repository root `.env` is loaded by `apps/web/next.config.ts`. The local value is the gateway at `http://127.0.0.1:8088`. Start the gateway before the web app. The gateway's `UPSTREAM_URL` is `http://127.0.0.1:8080`. The web application does not call port 8080 itself.
 
 ```powershell
-cd D:\lokasolve-api-gateway
+cd services\api-gateway
 go run ./cmd/gateway
 ```
 

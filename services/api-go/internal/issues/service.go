@@ -37,6 +37,17 @@ type Issue struct {
 	Status                    string          `json:"status"`
 	CreatedAt                 time.Time       `json:"created_at"`
 	Visibility                string          `json:"visibility"`
+	Severity                  *IssueSeverity  `json:"severity,omitempty"`
+	SafetyGuidance            *string         `json:"safety_guidance,omitempty"`
+	EscalationDue             *time.Time      `json:"escalation_due_at,omitempty"`
+}
+
+type IssueSeverity struct {
+	Level      string   `json:"level"`
+	Source     string   `json:"source"`
+	Confidence *float64 `json:"confidence"`
+	Reason     string   `json:"reason"`
+	Overridden bool     `json:"overridden"`
 }
 
 // PublicReport is the only shape returned to someone who can see that a report
@@ -133,6 +144,7 @@ func (s *Service) Create(ctx context.Context, principal authn.Principal, in Crea
 	if category != nil {
 		status = "UNDER_REVIEW"
 	}
+	var classification workflow.Classification
 	err = s.DB.WithFlags(ctx, &principal.UserID, identity.AccessFlags(principal), func(tx pgx.Tx) error {
 		if in.ProblemTypeID != nil {
 			var exists bool
@@ -156,7 +168,11 @@ func (s *Service) Create(ctx context.Context, principal authn.Principal, in Crea
 			return err
 		}
 		issue.Visibility = "owner"
-		if err := workflow.Record(ctx, tx, principal.UserID, id, principal.UserID, "intake", "Report saved. "+assessment.Reason, "Report saved"); err != nil {
+		intake := "Report saved."
+		if assessment.Suggestion != "" {
+			intake += " A keyword suggested the label " + assessment.Suggestion + ". That is not an official classification."
+		}
+		if err := workflow.Record(ctx, tx, principal.UserID, id, principal.UserID, "intake", intake, "Report saved"); err != nil {
 			return err
 		}
 		if assessment.Safety != "" {
@@ -164,21 +180,33 @@ func (s *Service) Create(ctx context.Context, principal authn.Principal, in Crea
 				return err
 			}
 		}
-		if assessment.NeedsReview {
-			if err := workflow.OpenReview(ctx, tx, id, assessment.Reason); err != nil {
-				return err
-			}
-		}
+		extra := []string{}
 		if locality != nil {
 			var others int
 			if err := tx.QueryRow(ctx, `SELECT count(*) FROM issues WHERE id <> $1 AND lower(coalesce(locality_text, '')) = lower($2)`, id, *locality).Scan(&others); err != nil {
 				return err
 			}
 			if others > 0 {
-				if err := workflow.OpenReview(ctx, tx, id, "Another visible report uses the same locality text. Compare them before treating them as one incident."); err != nil {
-					return err
-				}
+				extra = append(extra, "Another report uses the same locality text. Compare them before treating them as one incident.")
 			}
+		}
+		classified, err := workflow.ApplySeverity(ctx, tx, principal.UserID, id, description, urgency, locality, category, extra)
+		if err != nil {
+			return err
+		}
+		issue.Severity = &IssueSeverity{
+			Level: classified.Level, Source: classified.Source, Reason: classified.Reason, Overridden: false,
+		}
+		if classified.Safety != "" {
+			issue.SafetyGuidance = &classified.Safety
+		} else if assessment.Safety != "" {
+			issue.SafetyGuidance = &assessment.Safety
+		}
+		due := classified.EscalationDue
+		issue.EscalationDue = &due
+		classification = classified
+		if assessment.Safety != "" && classification.Safety == "" {
+			classification.Safety = assessment.Safety
 		}
 		if err := audit.Write(ctx, tx, audit.Entry{
 			ActorID: &principal.UserID, ActorRole: "reporter", Action: "issue.create",
@@ -188,20 +216,32 @@ func (s *Service) Create(ctx context.Context, principal authn.Principal, in Crea
 			return err
 		}
 		return events.Enqueue(ctx, tx, "issue", id, "report.created", map[string]any{
-			"issue_id": id.String(), "status": status, "stated_urgency": urgency,
+			"issue_id": id.String(), "reporter_user_id": principal.UserID.String(),
+			"status": status, "stated_urgency": urgency, "severity": classification.Level,
 		})
 	})
 	if err != nil {
 		return Issue{}, nil, err
 	}
-	if urgency != "immediate_risk" {
+	if classification.Safety == "" && urgency != "immediate_risk" && classification.Level != "P0" {
 		return issue, nil, nil
 	}
+	message := classification.Safety
+	if message == "" {
+		message = "LokaSolve has not dispatched anyone. If someone is in immediate danger, contact India's emergency number 112. For a mental-health crisis, Tele-MANAS is 14416. Do not wait for this report."
+	}
+	if !strings.Contains(message, "has not dispatched") {
+		message += " LokaSolve has not dispatched anyone."
+	}
+	channels := []string{"112"}
+	if strings.Contains(message, "14416") {
+		channels = append(channels, "14416")
+	}
 	return issue, &SafetyNotice{
-		ImmediateDanger: true,
+		ImmediateDanger: urgency == "immediate_risk" || classification.Level == "P0",
 		Dispatched:      false,
-		Channels:        []string{"112", "14416"},
-		Message:         "LokaSolve has not dispatched anyone. If someone is in immediate danger, contact India's emergency number 112. For a mental-health crisis, Tele-MANAS is 14416. Do not wait for this report.",
+		Channels:        channels,
+		Message:         message,
 	}, nil
 }
 
@@ -291,6 +331,21 @@ func (s *Service) Get(ctx context.Context, principal authn.Principal, id uuid.UU
 		default:
 			issue.Visibility = "jurisdiction"
 		}
+		var level, source, reason string
+		var confidence *float64
+		var overridden bool
+		var guidance *string
+		var due *time.Time
+		if err := tx.QueryRow(ctx, `
+			SELECT severity, severity_source, severity_confidence, severity_reason,
+				severity_overridden, safety_guidance, escalation_due_at
+			FROM issues WHERE id = $1
+		`, id).Scan(&level, &source, &confidence, &reason, &overridden, &guidance, &due); err != nil {
+			return err
+		}
+		issue.Severity = &IssueSeverity{Level: level, Source: source, Confidence: confidence, Reason: reason, Overridden: overridden}
+		issue.SafetyGuidance = guidance
+		issue.EscalationDue = due
 		view = issue
 		return nil
 	})

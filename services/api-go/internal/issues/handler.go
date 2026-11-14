@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"lokasolve/services/api-go/internal/auth"
+	"lokasolve/services/api-go/internal/issuemode"
 	"lokasolve/services/api-go/internal/platform/httpx"
 )
 
@@ -21,6 +22,9 @@ func (h Handler) Routes(r chi.Router) {
 }
 
 func (h Handler) create(w http.ResponseWriter, r *http.Request) {
+	if issuemode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	var req struct {
 		Description               string            `json:"description"`
@@ -66,6 +70,9 @@ func (h Handler) create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) list(w http.ResponseWriter, r *http.Request) {
+	if issuemode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	items, err := h.Service.List(r.Context(), principal, r.URL.Query().Get("q"))
 	if err != nil {
@@ -76,6 +83,9 @@ func (h Handler) list(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) get(w http.ResponseWriter, r *http.Request) {
+	if issuemode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	id, err := uuid.Parse(chi.URLParam(r, "issueID"))
 	if err != nil {

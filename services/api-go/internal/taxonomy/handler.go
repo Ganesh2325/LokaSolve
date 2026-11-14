@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"lokasolve/services/api-go/internal/auth"
+	"lokasolve/services/api-go/internal/issuemode"
 	"lokasolve/services/api-go/internal/platform/httpx"
 )
 
@@ -18,6 +19,9 @@ func (h Handler) Routes(r chi.Router) {
 }
 
 func (h Handler) list(w http.ResponseWriter, r *http.Request) {
+	if issuemode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	categories, err := h.Service.List(r.Context(), principal)
 	if err != nil {
@@ -28,6 +32,9 @@ func (h Handler) list(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) add(w http.ResponseWriter, r *http.Request) {
+	if issuemode.Blocked(w, r) {
+		return
+	}
 	principal, _ := auth.Current(r.Context())
 	var req struct {
 		CategoryName string `json:"category_name"`

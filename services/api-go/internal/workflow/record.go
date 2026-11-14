@@ -42,7 +42,15 @@ func Notify(ctx context.Context, tx pgx.Tx, userID, issueID uuid.UUID, title, bo
 
 func OpenReview(ctx context.Context, tx pgx.Tx, issueID uuid.UUID, reason string) error {
 	_, err := tx.Exec(ctx, `
-		INSERT INTO review_items (id, issue_id, reason) VALUES ($1, $2, $3)
-	`, uuid.New(), issueID, reason)
+		INSERT INTO review_items (
+			id, issue_id, reason, severity, geographic_area, deadline_at, report_excerpt
+		)
+		SELECT $1, v.id, $2, COALESCE(v.severity, 'P3'), COALESCE(v.locality_text, 'Not provided'),
+			COALESCE(v.escalation_due_at, now() + interval '24 hours'), left(v.description, 280)
+		FROM issue_visible($3) v
+		WHERE NOT EXISTS (
+			SELECT 1 FROM review_items WHERE issue_id = $3 AND status = 'open'
+		)
+	`, uuid.New(), reason, issueID)
 	return err
 }

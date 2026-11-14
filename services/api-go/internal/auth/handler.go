@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"lokasolve/services/api-go/internal/identitymode"
 	"lokasolve/services/api-go/internal/platform/httpx"
 	"lokasolve/services/api-go/internal/views"
 )
@@ -29,6 +30,9 @@ func (h Handler) Routes(r chi.Router) {
 }
 
 func (h Handler) register(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		httpx.WriteError(w, r, httpx.New(http.StatusBadRequest, "validation_error", "The request body could not be read."))
@@ -62,6 +66,9 @@ func (h Handler) register(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) login(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	var req struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
@@ -79,6 +86,9 @@ func (h Handler) login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) refresh(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	token, err := presentedRefresh(r)
 	if err != nil {
 		httpx.WriteError(w, r, err)
@@ -93,6 +103,9 @@ func (h Handler) refresh(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) logout(w http.ResponseWriter, r *http.Request) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	token, err := presentedRefresh(r)
 	if err != nil {
 		httpx.WriteError(w, r, err)
@@ -120,6 +133,9 @@ func (h Handler) RequestPhoneOTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) requestOTP(w http.ResponseWriter, r *http.Request, userID *uuid.UUID) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	var req struct {
 		Phone   string `json:"phone"`
 		Purpose string `json:"purpose"`
@@ -152,6 +168,9 @@ func (h Handler) VerifyPhoneOTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h Handler) verifyOTP(w http.ResponseWriter, r *http.Request, userID *uuid.UUID) {
+	if identitymode.Blocked(w, r) {
+		return
+	}
 	var req struct {
 		Phone   string `json:"phone"`
 		Purpose string `json:"purpose"`
